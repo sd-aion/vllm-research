@@ -15,6 +15,7 @@ The vLLM source tree used by these notes is `/home/ubuntu/vllm`. Source paths in
 | Triton attention backend | [attention/triton_attention_trace/README.md](attention/triton_attention_trace/README.md) | vLLM-owned Triton cache-update, unified attention, segmented decode, reduction, encoder attention, helper, and adjacent paged-decode kernels. |
 | TurboQuant backend | [attention/turboquant_attention_trace/README.md](attention/turboquant_attention_trace/README.md) | Compressed KV-cache algorithm, cache layout, store kernels, prefill, continuation prefill, split-KV decode, full dequantization, and limitations. |
 | KV-cache management | [kv_cache/kv_cache_trace/README.md](kv_cache/kv_cache_trace/README.md) | Configuration, cache specs, profiling, physical allocation, block management, prefix caching, block tables, slot mapping, KV connectors, CPU offloading, and backend integration. |
+| TurboQuant KV benchmark | [turboquant_kv_benchmark/README.md](turboquant_kv_benchmark/README.md) | Pure-PyTorch correctness benchmark comparing vLLM-style TurboQuant KV cache reconstruction against paper-style MSE and MSE+QJL TurboQuant variants. |
 
 ## Current Scope Boundaries
 

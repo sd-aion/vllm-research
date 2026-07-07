@@ -41,11 +41,15 @@ The model runner maintains a dense batch index for active cached request state.
 
 `add_row(block_ids, row_idx)` replaces a request row.
 
-`append_row(...)` adds newly allocated decode/lookahead blocks to an existing row.
+`append_row(block_ids, row_idx)` in `vllm/v1/worker/block_table.py` extends an existing request row instead of replacing it. The row already contains the block IDs for the request's earlier tokens; `append_row(...)` writes the newly allocated block IDs after the current valid row length and increments `num_blocks_per_row[row_idx]`. This is the worker-side update for a continuing request whose KV-cache block table grows during decode, chunked prefill, or speculative lookahead.
 
 `clear_row(...)` removes stale IDs when a request leaves the worker batch.
 
-`move_row(...)` and `swap_row(...)` support batch compaction/reordering without rebuilding every table.
+`move_row(src, tgt)` in `vllm/v1/worker/block_table.py` copies the valid block IDs from one request row to another row and copies the valid row length. It is used by `InputBatch.condense(...)` in `vllm/v1/worker/gpu_input_batch.py` after requests finish or are removed. If row `2` becomes empty and the last active request is at row `7`, condense can move row `7` into row `2` so active requests stay packed at low indices.
+
+`swap_row(src, tgt)` in `vllm/v1/worker/block_table.py` exchanges two request rows and their row lengths. It is used when the input batch explicitly swaps request indices, such as `InputBatch.swap_states(...)` in `vllm/v1/worker/gpu_input_batch.py`.
+
+Both methods update worker-side metadata only: the row-to-block-ID table changes, but the actual KV cache tensors are not copied. The physical KV pages stay where they are; only the request batch row that points to those page IDs changes.
 
 `commit_block_table(num_reqs)` copies active CPU rows to the persistent GPU buffer before metadata construction and model execution.
 
@@ -107,6 +111,10 @@ Inputs are:
 - CP world/rank and interleave settings.
 - Persistent output slot-mapping buffer.
 
+The slot-mapping buffer is `BlockTable.slot_mapping` in `vllm/v1/worker/block_table.py`. It is a reusable CPU/GPU buffer sized to `max_num_batched_tokens`; each scheduler step overwrites the prefix corresponding to the currently scheduled packed tokens, and the extra padding program fills unused CUDA-graph padding slots with `PAD_SLOT_ID`.
+
+With multiple KV-cache groups, `MultiGroupBlockTable` owns one `BlockTable` per group, so each group has its own slot-mapping buffer. That matters when groups have different block sizes or block-table rows.
+
 The kernel launches one program per request plus one padding program.
 
 ## Basic Slot Formula
@@ -119,6 +127,18 @@ block_offset = position % block_size
 block_number = block_table[request, block_index]
 slot_mapping[token] = block_number * block_size + block_offset
 ```
+
+Variable meanings:
+
+- `position`: absolute logical token position within the request sequence.
+- `block_size`: number of token slots in one kernel KV-cache block.
+- `block_index`: logical block index inside this request, computed from `position`.
+- `block_offset`: token offset inside that logical block.
+- `request`: worker batch row index for this request.
+- `block_table[request, block_index]`: physical KV-cache block ID assigned to that logical request block.
+- `block_number`: physical KV-cache block ID read from the block table.
+- `slot_mapping[token]`: flat physical KV-cache slot where this scheduled token's K/V should be written.
+- `token`: index of the current scheduled token inside the packed batch.
 
 The value is flat across physical blocks and token rows; KV head and K/V dimensions are handled by the update kernel.
 
@@ -179,13 +199,24 @@ The final local slot is `physical_block * local_block_size + local_offset`.
 
 ## InputBatch Updates
 
-`GPUModelRunner._update_states(...)` consumes scheduler output and updates cached request rows.
+`GPUModelRunner._update_states(...)` in `vllm/v1/worker/gpu_model_runner.py` is the worker-side method that applies one `SchedulerOutput` to the model runner's persistent batch state. The scheduler tells the worker which requests are scheduled this step, how many tokens each request has computed, and what new block IDs were allocated. `_update_states(...)` turns that scheduler message into concrete updates to the worker's request table and block table.
 
-New requests call `add_row(...)` with their complete group block IDs.
+There are two worker-side request structures involved:
 
-Continuing requests call `append_row(...)` for newly allocated blocks.
+- `GPUModelRunner.requests`: a dict from `req_id` to `CachedRequestState`, holding the worker's cached copy of request state such as token IDs, output IDs, block IDs, and `num_computed_tokens`.
+- `InputBatch`: a dense active-batch table where each active request has a row index `req_index`. `InputBatch.req_id_to_index` maps `req_id` to that row.
 
-Batch compaction keeps block-table rows synchronized with request-state indices.
+The method first removes requests that are not scheduled in this step from the persistent `InputBatch` rows. Their `CachedRequestState` can remain in `GPUModelRunner.requests`, because the request may be scheduled again later.
+
+New requests get a fresh `CachedRequestState` from scheduler-provided request data. When they are inserted into `InputBatch`, `InputBatch.add_request(...)` in `vllm/v1/worker/gpu_input_batch.py` assigns a row index, records `req_id_to_index[req_id] = req_index`, copies token/count metadata, and calls `block_table.add_row(request.block_ids, req_index)` with the complete group block IDs.
+
+Continuing requests call `append_row(...)` for newly allocated blocks. The call site is `GPUModelRunner._update_states(...)` in `vllm/v1/worker/gpu_model_runner.py`: when `new_block_ids` arrives for a request that is already present in the persistent batch, the runner appends those IDs to that request's existing block-table row. This keeps the worker row aligned with the scheduler's request block sequence without rebuilding the whole row every step.
+
+For a continuing request already in `InputBatch`, `_update_states(...)` finds the row with `self.input_batch.req_id_to_index.get(req_id)`, updates `input_batch.num_computed_tokens_cpu[req_index]`, appends new block IDs to both `req_state.block_ids` and `input_batch.block_table`, and updates token buffers if new output tokens were produced.
+
+If a request was preempted and later resumed, it may not currently have an `InputBatch` row. In that case `_update_states(...)` replaces the cached block-ID sequence on `CachedRequestState` with the newly assigned scheduler block IDs and then re-adds the request to `InputBatch` as a resumed request.
+
+After additions/removals, `InputBatch.condense(...)` in `vllm/v1/worker/gpu_input_batch.py` fills holes in the dense batch rows. When a row moves, it also calls block-table row movement methods so `req_id_to_index`, token buffers, count buffers, and block-table rows all keep the same row meaning.
 
 Before input preparation completes, block tables are committed to GPU and slot mappings are computed for the packed token positions.
 
@@ -250,7 +281,11 @@ When true, the attention implementation writes current K/V as part of its forwar
 
 When false, the common layer invokes `unified_kv_cache_update(...)` before `unified_attention_with_output(...)`.
 
-A dummy tensor dependency ensures `torch.compile` preserves update-before-read ordering even though attention does not consume a meaningful update result.
+`unified_kv_cache_update(...)` in `vllm/model_executor/layers/attention/attention.py` mutates the KV-cache tensor through `attn_layer.impl.do_kv_cache_update(...)`, but its useful effect is a side effect, not a meaningful returned value. It therefore returns an empty dummy tensor.
+
+`Attention.forward(...)` passes that dummy tensor into `unified_attention_with_output(...)` as `kv_cache_dummy_dep`. `unified_attention_with_output(...)` immediately deletes the argument, but accepting it creates a visible data dependency for `torch.compile`: the attention op appears to depend on the output of the cache-update op.
+
+That dependency prevents the compiler from legally reordering attention before the KV-cache write. Without it, the compiler may see two opaque custom ops where the first has no consumed result and could move the attention read ahead of the update, which would make decode read stale or missing K/V for the current tokens.
 
 ## Writing Current K/V
 

@@ -9,7 +9,7 @@ This chapter explains the configuration and type system that determine how many 
 Important fields are:
 
 - `block_size`: default physical cache block size in tokens; the default is 16 before platform/backend adjustment.
-- `hash_block_size`: token granularity used for request block hashes and prefix-cache lookup.
+- `hash_block_size`: token block size used for request block hashes and prefix-cache lookup.
 - `gpu_memory_utilization`: fraction of device memory available to the model executor when an explicit cache byte budget is absent.
 - `kv_cache_memory_bytes`: explicit per-GPU KV-cache byte budget; when set, it takes precedence over utilization-derived capacity.
 - `cache_dtype`: logical cache dtype or quantized cache format.
@@ -20,7 +20,7 @@ Important fields are:
 - `kv_cache_dtype_skip_layers`: layer indices or attention-type labels that retain native cache dtype.
 - `sliding_window`: model-level window copied into cache configuration.
 - `mamba_block_size`, `mamba_cache_dtype`, `mamba_ssm_cache_dtype`, and `mamba_cache_mode`: state-cache controls for hybrid models.
-- `kv_sharing_fast_prefill`: enables metadata changes for eligible cache-sharing models.
+- `kv_sharing_fast_prefill`: enables metadata changes for eligible cache-sharing models. (WIP acc to v 0.23.0)
 - `kv_offloading_size`: total offload capacity in GiB, summed across TP ranks.
 - `kv_offloading_backend`: native vLLM offload or LMCache.
 - `num_gpu_blocks` and `num_cpu_blocks`: resolved fields populated after profiling.
